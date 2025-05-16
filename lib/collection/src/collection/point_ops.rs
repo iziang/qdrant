@@ -1,3 +1,4 @@
+use std::backtrace::Backtrace;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -170,21 +171,37 @@ impl Collection {
         let result_len = results.len();
 
         if with_error > 0 {
-            let first_err = results.into_iter().find(|result| result.is_err()).unwrap();
+            // Collect all failed shard IDs and the first error
+            let mut failed_shards = Vec::new();
+            let mut first_err = None;
+            
+            for (shard_id, result) in results.into_iter().enumerate() {
+                if let Err(err) = result {
+                    failed_shards.push(shard_id as ShardId);
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+
             // inconsistent if only a subset of the requests fail - one request per shard.
             if with_error < result_len {
-                first_err.map_err(|err| {
-                    // compute final status code based on the first error
-                    // e.g. a partially successful batch update failing because of bad input is a client error
-                    CollectionError::InconsistentShardFailure {
-                        shards_total: result_len as u32, // report only the number of shards that took part in the update
+                match first_err {
+                    Some(err) => Err(CollectionError::InconsistentShardFailure {
+                        shards_total: result_len as u32,
                         shards_failed: with_error as u32,
+                        failed_shards,
                         first_err: Box::new(err),
-                    }
-                })
+                        backtrace: Some(Backtrace::force_capture().to_string()),
+                    }),
+                    None => unreachable!("We know there are errors because with_error > 0"),
+                }
             } else {
                 // all requests per shard failed - propagate first error (assume there are all the same)
-                first_err
+                match first_err {
+                    Some(err) => Err(err),
+                    None => unreachable!("We know there are errors because with_error > 0"),
+                }
             }
         } else {
             // At least one result is always present.

@@ -239,265 +239,353 @@ impl RemoteShard {
     pub async fn execute_update_operation(
         &self,
         shard_id: Option<ShardId>,
-        collection_name: String,
+        collection_name: CollectionId,
         operation: OperationWithClockTag,
         wait: bool,
         ordering: Option<WriteOrdering>,
     ) -> CollectionResult<UpdateResult> {
-        // Cancelling remote request should always be safe on the client side and update API
-        // *should be* cancel safe on the server side, so this method is cancel safe.
+        // Log the start of remote update operation
+        log::info!(
+            "Executing update operation on remote shard {} on peer {}, operation: {:?}, wait: {}",
+            shard_id.unwrap_or(self.id),
+            self.peer_id,
+            operation,
+            wait
+        );
 
         let mut timer = ScopeDurationMeasurer::new(&self.telemetry_update_durations);
         timer.set_success(false);
 
         let point_operation_response = match operation.operation {
-            CollectionUpdateOperations::PointOperation(point_ops) => match point_ops {
-                PointOperations::UpsertPoints(point_insert_operations) => {
-                    let request = &internal_upsert_points(
-                        shard_id,
-                        operation.clock_tag,
-                        collection_name,
-                        point_insert_operations,
-                        wait,
-                        ordering,
-                    )?;
-                    self.with_points_client(|mut client| async move {
-                        client.upsert(tonic::Request::new(request.clone())).await
-                    })
-                    .await?
-                    .into_inner()
+            CollectionUpdateOperations::PointOperation(point_ops) => {
+                // Log the specific point operation type
+                log::info!(
+                    "Executing point operation on remote shard {} on peer {}: {:?}",
+                    shard_id.unwrap_or(self.id),
+                    self.peer_id,
+                    point_ops
+                );
+
+                match point_ops {
+                    PointOperations::UpsertPoints(point_insert_operations) => {
+                        let request = &internal_upsert_points(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name,
+                            point_insert_operations,
+                            wait,
+                            ordering,
+                        )?;
+                        self.with_points_client(|mut client| async move {
+                            client.upsert(tonic::Request::new(request.clone())).await
+                        })
+                        .await?
+                        .into_inner()
+                    }
+                    PointOperations::DeletePoints { ids } => {
+                        // Log the delete points operation
+                        log::info!(
+                            "Deleting points on remote shard {} on peer {}: {:?}",
+                            shard_id.unwrap_or(self.id),
+                            self.peer_id,
+                            ids
+                        );
+
+                        let request = &internal_delete_points(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name,
+                            ids,
+                            wait,
+                            ordering,
+                        );
+                        self.with_points_client(|mut client| async move {
+                            client.delete(tonic::Request::new(request.clone())).await
+                        })
+                        .await?
+                        .into_inner()
+                    }
+                    PointOperations::DeletePointsByFilter(filter) => {
+                        // Log the delete points by filter operation
+                        log::info!(
+                            "Deleting points by filter on remote shard {} on peer {}: {:?}",
+                            shard_id.unwrap_or(self.id),
+                            self.peer_id,
+                            filter
+                        );
+
+                        let request = &internal_delete_points_by_filter(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name,
+                            filter,
+                            wait,
+                            ordering,
+                        );
+                        self.with_points_client(|mut client| async move {
+                            client.delete(tonic::Request::new(request.clone())).await
+                        })
+                        .await?
+                        .into_inner()
+                    }
+                    PointOperations::SyncPoints(operation) => {
+                        // Log the sync points operation
+                        log::info!(
+                            "Syncing points on remote shard {} on peer {}: {:?}",
+                            shard_id.unwrap_or(self.id),
+                            self.peer_id,
+                            operation
+                        );
+
+                        let request = &internal_sync_points(
+                            shard_id,
+                            None, // TODO!?
+                            collection_name,
+                            operation,
+                            wait,
+                            ordering,
+                        )?;
+                        self.with_points_client(|mut client| async move {
+                            client.sync(tonic::Request::new(request.clone())).await
+                        })
+                        .await?
+                        .into_inner()
+                    }
                 }
-                PointOperations::DeletePoints { ids } => {
-                    let request = &internal_delete_points(
-                        shard_id,
-                        operation.clock_tag,
-                        collection_name,
-                        ids,
-                        wait,
-                        ordering,
-                    );
-                    self.with_points_client(|mut client| async move {
-                        client.delete(tonic::Request::new(request.clone())).await
-                    })
-                    .await?
-                    .into_inner()
+            }
+            CollectionUpdateOperations::VectorOperation(vector_ops) => {
+                // Log the vector operation
+                log::info!(
+                    "Executing vector operation on remote shard {} on peer {}: {:?}",
+                    shard_id.unwrap_or(self.id),
+                    self.peer_id,
+                    vector_ops
+                );
+
+                match vector_ops {
+                    VectorOperations::UpdateVectors(update_operation) => {
+                        let request = &internal_update_vectors(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name,
+                            update_operation,
+                            wait,
+                            ordering,
+                        );
+                        self.with_points_client(|mut client| async move {
+                            client
+                                .update_vectors(tonic::Request::new(request.clone()))
+                                .await
+                        })
+                        .await?
+                        .into_inner()
+                    }
+                    VectorOperations::DeleteVectors(ids, vector_names) => {
+                        let request = &internal_delete_vectors(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name,
+                            ids.points,
+                            vector_names.clone(),
+                            wait,
+                            ordering,
+                        );
+                        self.with_points_client(|mut client| async move {
+                            client
+                                .delete_vectors(tonic::Request::new(request.clone()))
+                                .await
+                        })
+                        .await?
+                        .into_inner()
+                    }
+                    VectorOperations::DeleteVectorsByFilter(filter, vector_names) => {
+                        let request = &internal_delete_vectors_by_filter(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name,
+                            filter,
+                            vector_names.clone(),
+                            wait,
+                            ordering,
+                        );
+                        self.with_points_client(|mut client| async move {
+                            client
+                                .delete_vectors(tonic::Request::new(request.clone()))
+                                .await
+                        })
+                        .await?
+                        .into_inner()
+                    }
                 }
-                PointOperations::DeletePointsByFilter(filter) => {
-                    let request = &internal_delete_points_by_filter(
-                        shard_id,
-                        operation.clock_tag,
-                        collection_name,
-                        filter,
-                        wait,
-                        ordering,
-                    );
-                    self.with_points_client(|mut client| async move {
-                        client.delete(tonic::Request::new(request.clone())).await
-                    })
-                    .await?
-                    .into_inner()
+            }
+            CollectionUpdateOperations::PayloadOperation(payload_ops) => {
+                // Log the payload operation
+                log::info!(
+                    "Executing payload operation on remote shard {} on peer {}: {:?}",
+                    shard_id.unwrap_or(self.id),
+                    self.peer_id,
+                    payload_ops
+                );
+
+                match payload_ops {
+                    PayloadOps::SetPayload(set_payload) => {
+                        let request = &internal_set_payload(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name,
+                            set_payload,
+                            wait,
+                            ordering,
+                        );
+                        self.with_points_client(|mut client| async move {
+                            client
+                                .set_payload(tonic::Request::new(request.clone()))
+                                .await
+                        })
+                        .await?
+                        .into_inner()
+                    }
+                    PayloadOps::DeletePayload(delete_payload) => {
+                        let request = &internal_delete_payload(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name,
+                            delete_payload,
+                            wait,
+                            ordering,
+                        );
+                        self.with_points_client(|mut client| async move {
+                            client
+                                .delete_payload(tonic::Request::new(request.clone()))
+                                .await
+                        })
+                        .await?
+                        .into_inner()
+                    }
+                    PayloadOps::ClearPayload { points } => {
+                        let request = &internal_clear_payload(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name,
+                            points,
+                            wait,
+                            ordering,
+                        );
+                        self.with_points_client(|mut client| async move {
+                            client
+                                .clear_payload(tonic::Request::new(request.clone()))
+                                .await
+                        })
+                        .await?
+                        .into_inner()
+                    }
+                    PayloadOps::ClearPayloadByFilter(filter) => {
+                        let request = &internal_clear_payload_by_filter(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name,
+                            filter,
+                            wait,
+                            ordering,
+                        );
+                        self.with_points_client(|mut client| async move {
+                            client
+                                .clear_payload(tonic::Request::new(request.clone()))
+                                .await
+                        })
+                        .await?
+                        .into_inner()
+                    }
+                    PayloadOps::OverwritePayload(set_payload) => {
+                        let request = &internal_set_payload(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name,
+                            set_payload,
+                            wait,
+                            ordering,
+                        );
+                        self.with_points_client(|mut client| async move {
+                            client
+                                .overwrite_payload(tonic::Request::new(request.clone()))
+                                .await
+                        })
+                        .await?
+                        .into_inner()
+                    }
                 }
-                PointOperations::SyncPoints(operation) => {
-                    let request = &internal_sync_points(
-                        shard_id,
-                        None, // TODO!?
-                        collection_name,
-                        operation,
-                        wait,
-                        ordering,
-                    )?;
-                    self.with_points_client(|mut client| async move {
-                        client.sync(tonic::Request::new(request.clone())).await
-                    })
-                    .await?
-                    .into_inner()
+            }
+            CollectionUpdateOperations::FieldIndexOperation(field_index_op) => {
+                // Log the field index operation
+                log::info!(
+                    "Executing field index operation on remote shard {} on peer {}: {:?}",
+                    shard_id.unwrap_or(self.id),
+                    self.peer_id,
+                    field_index_op
+                );
+
+                match field_index_op {
+                    FieldIndexOperations::CreateIndex(create_index) => {
+                        let request = &internal_create_index(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name,
+                            create_index,
+                            wait,
+                            ordering,
+                        );
+                        self.with_points_client(|mut client| async move {
+                            client
+                                .create_field_index(tonic::Request::new(request.clone()))
+                                .await
+                        })
+                        .await?
+                        .into_inner()
+                    }
+                    FieldIndexOperations::DeleteIndex(delete_index) => {
+                        let request = &internal_delete_index(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name,
+                            delete_index,
+                            wait,
+                            ordering,
+                        );
+                        self.with_points_client(|mut client| async move {
+                            client
+                                .delete_field_index(tonic::Request::new(request.clone()))
+                                .await
+                        })
+                        .await?
+                        .into_inner()
+                    }
                 }
-            },
-            CollectionUpdateOperations::VectorOperation(vector_ops) => match vector_ops {
-                VectorOperations::UpdateVectors(update_operation) => {
-                    let request = &internal_update_vectors(
-                        shard_id,
-                        operation.clock_tag,
-                        collection_name,
-                        update_operation,
-                        wait,
-                        ordering,
-                    );
-                    self.with_points_client(|mut client| async move {
-                        client
-                            .update_vectors(tonic::Request::new(request.clone()))
-                            .await
-                    })
-                    .await?
-                    .into_inner()
-                }
-                VectorOperations::DeleteVectors(ids, vector_names) => {
-                    let request = &internal_delete_vectors(
-                        shard_id,
-                        operation.clock_tag,
-                        collection_name,
-                        ids.points,
-                        vector_names.clone(),
-                        wait,
-                        ordering,
-                    );
-                    self.with_points_client(|mut client| async move {
-                        client
-                            .delete_vectors(tonic::Request::new(request.clone()))
-                            .await
-                    })
-                    .await?
-                    .into_inner()
-                }
-                VectorOperations::DeleteVectorsByFilter(filter, vector_names) => {
-                    let request = &internal_delete_vectors_by_filter(
-                        shard_id,
-                        operation.clock_tag,
-                        collection_name,
-                        filter,
-                        vector_names.clone(),
-                        wait,
-                        ordering,
-                    );
-                    self.with_points_client(|mut client| async move {
-                        client
-                            .delete_vectors(tonic::Request::new(request.clone()))
-                            .await
-                    })
-                    .await?
-                    .into_inner()
-                }
-            },
-            CollectionUpdateOperations::PayloadOperation(payload_ops) => match payload_ops {
-                PayloadOps::SetPayload(set_payload) => {
-                    let request = &internal_set_payload(
-                        shard_id,
-                        operation.clock_tag,
-                        collection_name,
-                        set_payload,
-                        wait,
-                        ordering,
-                    );
-                    self.with_points_client(|mut client| async move {
-                        client
-                            .set_payload(tonic::Request::new(request.clone()))
-                            .await
-                    })
-                    .await?
-                    .into_inner()
-                }
-                PayloadOps::DeletePayload(delete_payload) => {
-                    let request = &internal_delete_payload(
-                        shard_id,
-                        operation.clock_tag,
-                        collection_name,
-                        delete_payload,
-                        wait,
-                        ordering,
-                    );
-                    self.with_points_client(|mut client| async move {
-                        client
-                            .delete_payload(tonic::Request::new(request.clone()))
-                            .await
-                    })
-                    .await?
-                    .into_inner()
-                }
-                PayloadOps::ClearPayload { points } => {
-                    let request = &internal_clear_payload(
-                        shard_id,
-                        operation.clock_tag,
-                        collection_name,
-                        points,
-                        wait,
-                        ordering,
-                    );
-                    self.with_points_client(|mut client| async move {
-                        client
-                            .clear_payload(tonic::Request::new(request.clone()))
-                            .await
-                    })
-                    .await?
-                    .into_inner()
-                }
-                PayloadOps::ClearPayloadByFilter(filter) => {
-                    let request = &internal_clear_payload_by_filter(
-                        shard_id,
-                        operation.clock_tag,
-                        collection_name,
-                        filter,
-                        wait,
-                        ordering,
-                    );
-                    self.with_points_client(|mut client| async move {
-                        client
-                            .clear_payload(tonic::Request::new(request.clone()))
-                            .await
-                    })
-                    .await?
-                    .into_inner()
-                }
-                PayloadOps::OverwritePayload(set_payload) => {
-                    let request = &internal_set_payload(
-                        shard_id,
-                        operation.clock_tag,
-                        collection_name,
-                        set_payload,
-                        wait,
-                        ordering,
-                    );
-                    self.with_points_client(|mut client| async move {
-                        client
-                            .overwrite_payload(tonic::Request::new(request.clone()))
-                            .await
-                    })
-                    .await?
-                    .into_inner()
-                }
-            },
-            CollectionUpdateOperations::FieldIndexOperation(field_index_op) => match field_index_op
-            {
-                FieldIndexOperations::CreateIndex(create_index) => {
-                    let request = &internal_create_index(
-                        shard_id,
-                        operation.clock_tag,
-                        collection_name,
-                        create_index,
-                        wait,
-                        ordering,
-                    );
-                    self.with_points_client(|mut client| async move {
-                        client
-                            .create_field_index(tonic::Request::new(request.clone()))
-                            .await
-                    })
-                    .await?
-                    .into_inner()
-                }
-                FieldIndexOperations::DeleteIndex(delete_index) => {
-                    let request = &internal_delete_index(
-                        shard_id,
-                        operation.clock_tag,
-                        collection_name,
-                        delete_index,
-                        wait,
-                        ordering,
-                    );
-                    self.with_points_client(|mut client| async move {
-                        client
-                            .delete_field_index(tonic::Request::new(request.clone()))
-                            .await
-                    })
-                    .await?
-                    .into_inner()
-                }
-            },
+            }
         };
+
         match point_operation_response.result {
-            None => Err(CollectionError::service_error(
-                "Malformed UpdateResult type".to_string(),
-            )),
-            Some(update_result) => update_result.try_into().map_err(|e: Status| e.into()),
+            None => {
+                // Log error for malformed response
+                log::error!(
+                    "Received malformed update result from remote shard {} on peer {}",
+                    shard_id.unwrap_or(self.id),
+                    self.peer_id
+                );
+                Err(CollectionError::service_error(
+                    "Malformed UpdateResult type".to_string(),
+                ))
+            }
+            Some(update_result) => {
+                // Log successful update
+                log::info!(
+                    "Successfully executed update operation on remote shard {} on peer {}, result: {:?}",
+                    shard_id.unwrap_or(self.id),
+                    self.peer_id,
+                    update_result
+                );
+                timer.set_success(true);
+                update_result.try_into().map_err(|e: Status| e.into())
+            }
         }
     }
 

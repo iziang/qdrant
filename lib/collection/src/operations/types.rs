@@ -818,13 +818,14 @@ pub enum CollectionError {
     Cancelled { description: String },
     #[error("Bad shard selection: {description}")]
     BadShardSelection { description: String },
-    #[error(
-    "{shards_failed} out of {shards_total} shards failed to apply operation. First error captured: {first_err}"
-    )]
+    #[error("{shards_failed} out of {shards_total} shards failed to apply operation. Failed shards: [{failed_shards:?}]. First error captured: {first_err}")]
     InconsistentShardFailure {
         shards_total: u32,
         shards_failed: u32,
+        failed_shards: Vec<ShardId>,
         first_err: Box<CollectionError>,
+        #[doc(hidden)]
+        backtrace: Option<String>,
     },
     #[error("Remote shard on {peer_id} failed during forward proxy operation: {error}")]
     ForwardProxyError { peer_id: PeerId, error: Box<Self> },

@@ -1163,8 +1163,21 @@ impl SegmentEntry for Segment {
         let internal_id = self.id_tracker.borrow().internal_id(point_id);
         match internal_id {
             // Point does already not exist anymore
-            None => Ok(false),
+            None => {
+                log::debug!(
+                    "Point {} does not exist in segment at path {}, skipping deletion",
+                    point_id,
+                    self.current_path.display()
+                );
+                Ok(false)
+            }
             Some(internal_id) => {
+                log::info!(
+                    "Deleting point {} (internal_id: {}) from segment at path {}",
+                    point_id,
+                    internal_id,
+                    self.current_path.display()
+                );
                 self.handle_point_version_and_failure(op_num, Some(internal_id), |segment| {
                     // Mark point as deleted, drop mapping
                     segment.payload_index.borrow_mut().drop(internal_id)?;
@@ -1182,6 +1195,12 @@ impl SegmentEntry for Segment {
                     //     vector_storage.delete_vector(internal_id)?;
                     // }
 
+                    log::debug!(
+                        "Successfully deleted point {} (internal_id: {}) from segment at path {}",
+                        point_id,
+                        internal_id,
+                        segment.current_path.display()
+                    );
                     Ok((true, Some(internal_id)))
                 })
             }

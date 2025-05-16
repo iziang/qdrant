@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt as _, StreamExt as _};
-use itertools::Itertools as _;
 
 use super::{clock_set, ReplicaSetState, ReplicaState, ShardReplicaSet};
 use crate::operations::point_ops::WriteOrdering;
@@ -191,9 +190,13 @@ impl ShardReplicaSet {
         wait: bool,
         clock: &mut clock_set::ClockGuard,
     ) -> CollectionResult<Option<UpdateResult>> {
-        // `LocalShard::update` is not guaranteed to be cancel safe and it's impossible to cancel
-        // multiple parallel updates in a way that is *guaranteed* not to introduce inconsistencies
-        // between nodes, so this method is not cancel safe.
+        // Log the start of update operation
+        log::info!(
+            "Starting update operation in replica set for shard {}, operation: {:?}, wait: {}",
+            self.shard_id,
+            operation,
+            wait
+        );
 
         let remotes = self.remotes.read().await;
         let local = self.local.read().await;
@@ -210,11 +213,24 @@ impl ShardReplicaSet {
         let local_is_updatable = local.is_some() && self.peer_is_active_or_pending(&this_peer_id);
 
         if active_remote_shards.is_empty() && !local_is_updatable {
+            log::error!(
+                "No active replicas found for shard {} on peer {}",
+                self.shard_id,
+                this_peer_id
+            );
             return Err(CollectionError::service_error(format!(
                 "The replica set for shard {} on peer {} has no active replica",
                 self.shard_id, this_peer_id
             )));
         }
+
+        // Log the replicas that will receive the update
+        log::info!(
+            "Update operation will be applied to {} remote replicas and {} local replica for shard {}",
+            active_remote_shards.len(),
+            if local_is_updatable { 1 } else { 0 },
+            self.shard_id
+        );
 
         let current_clock_tick = clock.tick_once();
         let clock_tag = ClockTag::new(this_peer_id, clock.id() as _, current_clock_tick);
@@ -232,6 +248,12 @@ impl ShardReplicaSet {
 
                 let operation = operation.clone();
 
+                log::info!(
+                    "Applying update to local replica for shard {} on peer {}",
+                    self.shard_id,
+                    this_peer_id
+                );
+
                 let local_update = async move {
                     local
                         .get()
@@ -247,6 +269,12 @@ impl ShardReplicaSet {
 
         for remote in active_remote_shards {
             let operation = operation.clone();
+
+            log::info!(
+                "Forwarding update to remote replica for shard {} on peer {}",
+                self.shard_id,
+                remote.peer_id
+            );
 
             let remote_update = async move {
                 remote
@@ -266,7 +294,6 @@ impl ShardReplicaSet {
                     .collect()
                     .await
             }
-
             None => FuturesUnordered::from_iter(update_futures).collect().await,
         };
 
@@ -285,14 +312,22 @@ impl ShardReplicaSet {
 
         let minimal_success_count = write_consistency_factor.min(total_results);
 
-        let (successes, failures): (Vec<_>, Vec<_>) = all_res.into_iter().partition_result();
+        // Log the results of the update operation
+        let (successes, failures): (Vec<_>, Vec<_>) = all_res.into_iter().partition(Result::is_ok);
+        log::info!(
+            "Update operation completed for shard {}: {} successful, {} failed, required success count: {}",
+            self.shard_id,
+            successes.len(),
+            failures.len(),
+            minimal_success_count
+        );
 
         // Advance clock if some replica echoed *newer* tick
-
         let new_clock_tick = successes
             .iter()
-            .filter_map(|(_, result)| {
-                let echo_tag = result.clock_tag?;
+            .filter_map(|result| {
+                let (_, update_result) = result.as_ref().ok()?;
+                let echo_tag = update_result.clock_tag?;
 
                 if echo_tag.peer_id != clock_tag.peer_id {
                     debug_assert!(
@@ -323,15 +358,23 @@ impl ShardReplicaSet {
         // 2. Failed peer is in `Resharding` state
         // 3. ???
 
-        let failure_error = if let Some((peer_id, collection_error)) = failures.first() {
+        let failure_error = if let Some(Err((peer_id, collection_error))) = failures.first() {
             format!("Failed peer: {}, error: {}", peer_id, collection_error)
         } else {
             "".to_string()
         };
 
         if successes.len() >= minimal_success_count {
-            let wait_for_deactivation =
-                self.handle_failed_replicas(&failures, &self.replica_state.read());
+            let wait_for_deactivation = self.handle_failed_replicas(
+                failures.iter().filter_map(|result| {
+                    if let Err((peer_id, error)) = result {
+                        Some((*peer_id, error.clone()))
+                    } else {
+                        None
+                    }
+                }).collect::<Vec<_>>(),
+                &self.replica_state.read(),
+            );
 
             // report all failing peers to consensus
             if wait && wait_for_deactivation && !failures.is_empty() {
@@ -339,7 +382,13 @@ impl ShardReplicaSet {
                 let timeout = DEFAULT_SHARD_DEACTIVATION_TIMEOUT;
 
                 let replica_state = self.replica_state.clone();
-                let peer_ids: Vec<_> = failures.iter().map(|(peer_id, _)| *peer_id).collect();
+                let peer_ids: Vec<_> = failures.iter().filter_map(|result| {
+                    if let Err((peer_id, _)) = result {
+                        Some(*peer_id)
+                    } else {
+                        None
+                    }
+                }).collect();
 
                 let shards_disabled = tokio::task::spawn_blocking(move || {
                     replica_state.wait_for(
@@ -369,20 +418,35 @@ impl ShardReplicaSet {
 
         if !failures.is_empty() && successes.len() < minimal_success_count {
             self.handle_failed_replicas(
-                failures
-                    .iter()
-                    .filter(|(peer_id, _)| self.peer_is_resharding(peer_id)),
+                failures.iter().filter_map(|result| {
+                    if let Err((peer_id, error)) = result {
+                        if self.peer_is_resharding(peer_id) {
+                            Some((*peer_id, error.clone()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }).collect::<Vec<_>>(),
                 &self.replica_state.read(),
             );
 
             // completely failed - report error to user
-            let (_peer_id, err) = failures.into_iter().next().expect("failures is not empty");
-            return Err(err);
+            if let Some(Err((_peer_id, err))) = failures.into_iter().next() {
+                return Err(err);
+            }
         }
 
         if !successes
             .iter()
-            .any(|(peer_id, _)| self.peer_is_active_or_resharding(peer_id))
+            .any(|result| {
+                if let Ok((peer_id, _)) = result {
+                    self.peer_is_active_or_resharding(peer_id)
+                } else {
+                    false
+                }
+            })
         {
             return Err(CollectionError::service_error(format!(
                 "Failed to apply operation to at least one `Active` replica. \
@@ -392,19 +456,24 @@ impl ShardReplicaSet {
 
         let is_any_operation_rejected = successes
             .iter()
-            .any(|(_, res)| matches!(res.status, UpdateStatus::ClockRejected));
+            .any(|result| {
+                if let Ok((_, res)) = result {
+                    matches!(res.status, UpdateStatus::ClockRejected)
+                } else {
+                    false
+                }
+            });
 
         if is_any_operation_rejected {
             return Ok(None);
         }
 
         // there are enough successes, return the first one
-        let (_, res) = successes
-            .into_iter()
-            .next()
-            .expect("successes is not empty");
-
-        Ok(Some(res))
+        if let Some(Ok((_, res))) = successes.into_iter().next() {
+            Ok(Some(res))
+        } else {
+            Err(CollectionError::service_error("No successful updates found".to_string()))
+        }
     }
 
     fn peer_is_active_or_pending(&self, peer_id: &PeerId) -> bool {
@@ -429,7 +498,7 @@ impl ShardReplicaSet {
 
     fn handle_failed_replicas<'a>(
         &self,
-        failures: impl IntoIterator<Item = &'a (PeerId, CollectionError)>,
+        failures: impl IntoIterator<Item = (PeerId, CollectionError)>,
         state: &ReplicaSetState,
     ) -> bool {
         let mut wait_for_deactivation = false;
@@ -441,7 +510,7 @@ impl ShardReplicaSet {
                 self.shard_id,
             );
 
-            let Some(&peer_state) = state.get_peer_state(peer_id) else {
+            let Some(&peer_state) = state.get_peer_state(&peer_id) else {
                 continue;
             };
 
@@ -472,7 +541,7 @@ impl ShardReplicaSet {
                 self.shard_id
             );
 
-            self.add_locally_disabled(*peer_id);
+            self.add_locally_disabled(peer_id);
         }
 
         wait_for_deactivation

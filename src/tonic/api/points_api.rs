@@ -67,16 +67,32 @@ impl Points for PointsService {
         validate(request.get_ref())?;
 
         let access = extract_access(&mut request);
+        let delete_points = request.into_inner();
+        
+        // Log the delete request
+        log::info!(
+            "Received delete points request for collection: {}, points: {:?}, shard_key: {:?}",
+            delete_points.collection_name,
+            delete_points.points,
+            delete_points.shard_key_selector
+        );
 
         delete(
             self.dispatcher.toc(&access).clone(),
-            request.into_inner(),
+            delete_points,
             None,
             None,
             access,
         )
         .await
-        .map(|resp| resp.map(Into::into))
+        .map(|resp| {
+            // Log the response
+            log::info!(
+                "Delete points request completed with status: {:?}",
+                resp.get_ref().result
+            );
+            resp.map(Into::into)
+        })
     }
 
     async fn get(&self, mut request: Request<GetPoints>) -> Result<Response<GetResponse>, Status> {

@@ -8,7 +8,7 @@ use collection::operations::payload_ops::{
     DeletePayload, DeletePayloadOp, PayloadOps, SetPayload, SetPayloadOp,
 };
 use collection::operations::point_ops::{
-    FilterSelector, PointIdsList, PointInsertOperations, PointOperations, PointsSelector,
+    FilterSelector, PointIdsList, PointInsertOperations, PointInsertOperationsInternal, PointOperations, PointsSelector,
     WriteOrdering,
 };
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
@@ -169,13 +169,41 @@ pub async fn do_upsert_points(
     ordering: WriteOrdering,
     access: Access,
 ) -> Result<UpdateResult, StorageError> {
+    // Log the operation details
+    log::info!(
+        "Executing upsert points operation for collection: {}, shard_selection: {:?}, wait: {}, ordering: {:?}",
+        collection_name,
+        shard_selection,
+        wait,
+        ordering
+    );
+
     let (shard_key, operation) = operation.decompose();
+    
+    // Log the points being upserted
+    match &operation {
+        PointInsertOperationsInternal::PointsBatch(batch) => {
+            log::info!(
+                "Upserting batch points, count: {}, shard_key: {:?}",
+                batch.ids.len(),
+                shard_key
+            );
+        }
+        PointInsertOperationsInternal::PointsList(points) => {
+            log::info!(
+                "Upserting points by IDs: {:?}, shard_key: {:?}",
+                points.iter().map(|p| p.id).collect::<Vec<_>>(),
+                shard_key
+            );
+        }
+    }
+
     let collection_operation =
         CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(operation));
 
     let shard_selector = get_shard_selector_for_update(shard_selection, shard_key);
 
-    toc.update(
+    let result = toc.update(
         &collection_name,
         OperationWithClockTag::new(collection_operation, clock_tag),
         wait,
@@ -183,7 +211,26 @@ pub async fn do_upsert_points(
         shard_selector,
         access,
     )
-    .await
+    .await;
+
+    // Log the operation result
+    match &result {
+        Ok(update_result) => {
+            log::info!(
+                "Upsert points operation completed successfully, status: {:?}, operation_id: {:?}",
+                update_result.status,
+                update_result.operation_id
+            );
+        }
+        Err(err) => {
+            log::error!(
+                "Upsert points operation failed: {:?}",
+                err
+            );
+        }
+    }
+
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -197,18 +244,37 @@ pub async fn do_delete_points(
     ordering: WriteOrdering,
     access: Access,
 ) -> Result<UpdateResult, StorageError> {
+    // Log the operation details
+    log::info!(
+        "Executing delete points operation for collection: {}, shard_selection: {:?}, wait: {}, ordering: {:?}",
+        collection_name,
+        shard_selection,
+        wait,
+        ordering
+    );
+
     let (point_operation, shard_key) = match points {
         PointsSelector::PointIdsSelector(PointIdsList { points, shard_key }) => {
+            log::info!(
+                "Deleting points by IDs: {:?}, shard_key: {:?}",
+                points,
+                shard_key
+            );
             (PointOperations::DeletePoints { ids: points }, shard_key)
         }
         PointsSelector::FilterSelector(FilterSelector { filter, shard_key }) => {
+            log::info!(
+                "Deleting points by filter: {:?}, shard_key: {:?}",
+                filter,
+                shard_key
+            );
             (PointOperations::DeletePointsByFilter(filter), shard_key)
         }
     };
     let collection_operation = CollectionUpdateOperations::PointOperation(point_operation);
     let shard_selector = get_shard_selector_for_update(shard_selection, shard_key);
 
-    toc.update(
+    let result = toc.update(
         &collection_name,
         OperationWithClockTag::new(collection_operation, clock_tag),
         wait,
@@ -216,7 +282,26 @@ pub async fn do_delete_points(
         shard_selector,
         access,
     )
-    .await
+    .await;
+
+    // Log the operation result
+    match &result {
+        Ok(update_result) => {
+            log::info!(
+                "Delete points operation completed successfully, status: {:?}, operation_id: {:?}",
+                update_result.status,
+                update_result.operation_id
+            );
+        }
+        Err(err) => {
+            log::error!(
+                "Delete points operation failed: {:?}",
+                err
+            );
+        }
+    }
+
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
