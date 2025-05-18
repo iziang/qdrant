@@ -86,6 +86,8 @@ impl Collection {
         wait: bool,
         ordering: WriteOrdering,
     ) -> CollectionResult<UpdateResult> {
+        info!("Received forwarded update request for shard {} with ordering {:?}", shard_selection, ordering);
+        
         let update_lock = self.updates_lock.clone().read_owned().await;
         let shard_holder = self.shards_holder.clone().read_owned().await;
 
@@ -93,11 +95,15 @@ impl Collection {
             let _update_lock = update_lock;
 
             let Some(shard) = shard_holder.get_shard(&shard_selection) else {
+                warn!("No target shard {} found for forwarded update request", shard_selection);
                 return Ok(None);
             };
 
             match ordering {
-                WriteOrdering::Weak => shard.update_local(operation, wait).await,
+                WriteOrdering::Weak => {
+                    info!("Processing forwarded update request for shard {} with weak ordering", shard_selection);
+                    shard.update_local(operation, wait).await
+                },
                 WriteOrdering::Medium | WriteOrdering::Strong => {
                     if let Some(clock_tag) = operation.clock_tag {
                         log::warn!(
@@ -107,10 +113,17 @@ impl Collection {
                         );
                     }
 
-                    shard
+                    info!("Processing forwarded update request for shard {} with {:?} ordering", shard_selection, ordering);
+                    let result = shard
                         .update_with_consistency(operation.operation, wait, ordering)
-                        .await
-                        .map(Some)
+                        .await;
+                    
+                    match &result {
+                        Ok(_) => info!("Successfully processed forwarded update request for shard {}", shard_selection),
+                        Err(e) => warn!("Failed to process forwarded update request for shard {}: {}", shard_selection, e),
+                    }
+                    
+                    result.map(Some)
                 }
             }
         })
