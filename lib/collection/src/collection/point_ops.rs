@@ -4,6 +4,7 @@ use std::sync::Arc;
 use futures::stream::FuturesUnordered;
 use futures::{future, StreamExt as _, TryFutureExt, TryStreamExt as _};
 use itertools::Itertools;
+use log::{info, warn};
 use segment::data_types::order_by::{Direction, OrderBy};
 use segment::types::{Filter, ShardKey, WithPayload, WithPayloadInterface};
 use validator::Validate as _;
@@ -148,7 +149,34 @@ impl Collection {
                 .split_by_shard(operation, &shard_keys_selection)?
                 .into_iter()
                 .map(move |(shard, operation)| {
-                    shard.update_with_consistency(operation, wait, ordering)
+                    let shard_id = shard.shard_id;
+                    async move {
+                        // Get the actual peer that will execute this operation
+                        let (peer_id, peer_uri) = if shard.has_local_shard().await {
+                            // If this is a local shard, use this peer's info
+                            let peer_id = shard.this_peer_id();
+                            let peer_uri = shard.get_peer_uri(peer_id).unwrap_or_else(|| "unknown".to_string());
+                            (peer_id, peer_uri)
+                        } else {
+                            // For remote shards, find the active peer that will execute the operation
+                            let active_peers = shard.active_shards().await;
+                            if let Some(&peer_id) = active_peers.first() {
+                                let peer_uri = shard.get_peer_uri(peer_id).unwrap_or_else(|| "unknown".to_string());
+                                (peer_id, peer_uri)
+                            } else {
+                                // Fallback to this peer if no active peers found
+                                let peer_id = shard.this_peer_id();
+                                let peer_uri = shard.get_peer_uri(peer_id).unwrap_or_else(|| "unknown".to_string());
+                                (peer_id, peer_uri)
+                            }
+                        };
+                        let result = shard.update_with_consistency(operation, wait, ordering).await;
+                        match &result {
+                            Ok(_) => info!("Shard {} (peer {} at {}) update successful", shard_id, peer_id, peer_uri),
+                            Err(e) => warn!("Shard {} (peer {} at {}) update failed: {}", shard_id, peer_id, peer_uri, e),
+                        }
+                        result
+                    }
                 })
                 .collect();
 
@@ -173,6 +201,7 @@ impl Collection {
             let first_err = results.into_iter().find(|result| result.is_err()).unwrap();
             // inconsistent if only a subset of the requests fail - one request per shard.
             if with_error < result_len {
+                warn!("Partial failure: {} out of {} shards failed across different peers", with_error, result_len);
                 first_err.map_err(|err| {
                     // compute final status code based on the first error
                     // e.g. a partially successful batch update failing because of bad input is a client error
@@ -183,6 +212,7 @@ impl Collection {
                     }
                 })
             } else {
+                warn!("All shards failed: {} shards total across different peers", result_len);
                 // all requests per shard failed - propagate first error (assume there are all the same)
                 first_err
             }

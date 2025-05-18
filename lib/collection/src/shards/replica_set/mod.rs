@@ -895,6 +895,13 @@ impl ShardReplicaSet {
     pub(crate) fn get_snapshots_storage_manager(&self) -> CollectionResult<SnapshotStorageManager> {
         SnapshotStorageManager::new(self.shared_storage_config.snapshots_config.clone())
     }
+
+    pub fn get_peer_uri(&self, peer_id: PeerId) -> Option<String> {
+        self.channel_service.id_to_address
+            .read()
+            .get(&peer_id)
+            .map(|uri| uri.to_string())
+    }
 }
 
 /// Represents a replica set state
