@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::fmt::Write;
 
 use futures::stream::FuturesUnordered;
 use futures::{future, StreamExt as _, TryFutureExt, TryStreamExt as _};
@@ -11,10 +12,12 @@ use validator::Validate as _;
 
 use super::Collection;
 use crate::operations::consistency_params::ReadConsistency;
-use crate::operations::point_ops::WriteOrdering;
+use crate::operations::point_ops::{WriteOrdering, PointOperations, PointInsertOperationsInternal};
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::*;
 use crate::operations::{CollectionUpdateOperations, OperationWithClockTag};
+use crate::operations::vector_ops::VectorOperations;
+use api::rest::{VectorStruct, Vector};
 use crate::shards::shard::ShardId;
 
 impl Collection {
@@ -86,7 +89,9 @@ impl Collection {
         wait: bool,
         ordering: WriteOrdering,
     ) -> CollectionResult<UpdateResult> {
-        info!("Received forwarded update request for shard {} with ordering {:?}", shard_selection, ordering);
+        // Log operation details including vector dimensions
+        info!("Received forwarded update request for shard {} with ordering {:?}\nOperation vectors:\n{}", 
+            shard_selection, ordering, format_operation_vectors(&operation.operation));
         
         let update_lock = self.updates_lock.clone().read_owned().await;
         let shard_holder = self.shards_holder.clone().read_owned().await;
@@ -151,6 +156,9 @@ impl Collection {
         shard_keys_selection: Option<ShardKey>,
     ) -> CollectionResult<UpdateResult> {
         operation.validate()?;
+
+        // Log operation details including vector dimensions
+        info!("Processing update operation with vectors:\n{}", format_operation_vectors(&operation));
 
         let update_lock = self.updates_lock.clone().read_owned().await;
         let shard_holder = self.shards_holder.clone().read_owned().await;
@@ -495,5 +503,217 @@ fn merge_filters(filter: &mut Option<Filter>, resharding_filter: Option<Filter>)
             Some(filter) => filter.merge_owned(resharding_filter),
             None => resharding_filter,
         });
+    }
+}
+
+// Helper function to extract and format vectors from operation
+fn format_operation_vectors(operation: &CollectionUpdateOperations) -> String {
+    match operation {
+        CollectionUpdateOperations::PointOperation(point_ops) => {
+            match point_ops {
+                PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(points)) => {
+                    let mut result = String::new();
+                    for point in points {
+                        match &point.vector {
+                            VectorStruct::Single(vector) => {
+                                let dims = if vector.len() > 5 {
+                                    format!("[{}...]", vector[..5].iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                } else {
+                                    format!("[{}]", vector.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                };
+                                result.push_str(&format!("Point {}: vector dims {}\n", point.id, dims));
+                            },
+                            VectorStruct::MultiDense(vector) => {
+                                for (i, vector) in vector.iter().enumerate() {
+                                    let dims = if vector.len() > 5 {
+                                        format!("[{}...]", vector[..5].iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                    } else {
+                                        format!("[{}]", vector.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                    };
+                                    result.push_str(&format!("Point {}: vector {} dims {}\n", point.id, i, dims));
+                                }
+                            },
+                            VectorStruct::Named(vectors) => {
+                                for (name, vector) in vectors {
+                                    match vector {
+                                        Vector::Dense(vector) => {
+                                            let dims = if vector.len() > 5 {
+                                                format!("[{}...]", vector[..5].iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                            } else {
+                                                format!("[{}]", vector.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                            };
+                                            result.push_str(&format!("Point {}: vector {} dims {}\n", point.id, name, dims));
+                                        },
+                                        Vector::Sparse(vector) => {
+                                            let dims = if vector.values.len() > 5 {
+                                                format!("[{}...]", vector.values[..5].iter().zip(vector.indices[..5].iter()).map(|(v, i)| format!("{}:{}", i, v)).collect::<Vec<_>>().join(", "))
+                                            } else {
+                                                format!("[{}]", vector.values.iter().zip(vector.indices.iter()).map(|(v, i)| format!("{}:{}", i, v)).collect::<Vec<_>>().join(", "))
+                                            };
+                                            result.push_str(&format!("Point {}: vector {} dims {}\n", point.id, name, dims));
+                                        },
+                                        Vector::MultiDense(vectors) => {
+                                            for (i, vector) in vectors.iter().enumerate() {
+                                                let dims = if vector.len() > 5 {
+                                                    format!("[{}...]", vector[..5].iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                                } else {
+                                                    format!("[{}]", vector.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                                };
+                                                result.push_str(&format!("Point {}: vector {}_{} dims {}\n", point.id, name, i, dims));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    result
+                },
+                PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsBatch(batch)) => {
+                    let mut result = String::new();
+                    match &batch.vectors {
+                        api::rest::BatchVectorStruct::Single(vectors) => {
+                            for (i, (id, vector)) in batch.ids.iter().zip(vectors.iter()).enumerate() {
+                                let dims = if vector.len() > 5 {
+                                    format!("[{}...]", vector[..5].iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                } else {
+                                    format!("[{}]", vector.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                };
+                                result.push_str(&format!("Point {} vector: {}\n", id, dims));
+                            }
+                        },
+                        api::rest::BatchVectorStruct::MultiDense(vectors) => {
+                            for (i, (id, vectors)) in batch.ids.iter().zip(vectors.iter()).enumerate() {
+                                for (j, vector) in vectors.iter().enumerate() {
+                                    let dims = if vector.len() > 5 {
+                                        format!("[{}...]", vector[..5].iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                    } else {
+                                        format!("[{}]", vector.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                    };
+                                    result.push_str(&format!("Point {} vector {}: {}\n", 
+                                        id, j, dims));
+                                }
+                            }
+                        },
+                        api::rest::BatchVectorStruct::Named(vectors) => {
+                            for (name, vectors) in vectors {
+                                for (i, (id, vector)) in batch.ids.iter().zip(vectors.iter()).enumerate() {
+                                    match vector {
+                                        Vector::Dense(vector) => {
+                                            let dims = if vector.len() > 5 {
+                                                format!("[{}...]", vector[..5].iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                            } else {
+                                                format!("[{}]", vector.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                            };
+                                            result.push_str(&format!("Point {} vector '{}': {}\n", id, name, dims));
+                                        },
+                                        Vector::Sparse(vector) => {
+                                            let dims = if vector.values.len() > 5 {
+                                                format!("[{}...]", vector.values[..5].iter().zip(vector.indices[..5].iter()).map(|(v, i)| format!("{}:{}", i, v)).collect::<Vec<_>>().join(", "))
+                                            } else {
+                                                format!("[{}]", vector.values.iter().zip(vector.indices.iter()).map(|(v, i)| format!("{}:{}", i, v)).collect::<Vec<_>>().join(", "))
+                                            };
+                                            result.push_str(&format!("Point {} sparse vector '{}': {}\n", id, name, dims));
+                                        },
+                                        Vector::MultiDense(vectors) => {
+                                            for (j, vector) in vectors.iter().enumerate() {
+                                                let dims = if vector.len() > 5 {
+                                                    format!("[{}...]", vector[..5].iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                                } else {
+                                                    format!("[{}]", vector.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                                };
+                                                result.push_str(&format!("Point {} vector '{}' {}: {}\n", id, name, j, dims));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    result
+                },
+                PointOperations::DeletePoints { ids } => {
+                    format!("Delete operation for points: {:?}", ids)
+                },
+                PointOperations::DeletePointsByFilter(filter) => {
+                    format!("Delete points by filter: {:?}", filter)
+                },
+                PointOperations::SyncPoints(sync_op) => {
+                    format!("Sync points operation: {:?}", sync_op)
+                },
+            }
+        },
+        CollectionUpdateOperations::FieldIndexOperation(_) => "Field index operation".to_string(),
+        CollectionUpdateOperations::PayloadOperation(_) => "Payload operation".to_string(),
+        CollectionUpdateOperations::VectorOperation(vector_ops) => {
+            match vector_ops {
+                VectorOperations::UpdateVectors(update_vectors) => {
+                    let mut result = String::new();
+                    for point in &update_vectors.points {
+                        match &point.vector {
+                            VectorStruct::Single(vector) => {
+                                let dims = if vector.len() > 5 {
+                                    format!("[{}...]", vector[..5].iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                } else {
+                                    format!("[{}]", vector.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                };
+                                result.push_str(&format!("Update point {} vector: {}\n", 
+                                    point.id, dims));
+                            },
+                            VectorStruct::MultiDense(vector) => {
+                                for (i, vector) in vector.iter().enumerate() {
+                                    let dims = if vector.len() > 5 {
+                                        format!("[{}...]", vector[..5].iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                    } else {
+                                        format!("[{}]", vector.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                    };
+                                    result.push_str(&format!("Update point {} vector {}: {}\n", 
+                                        point.id, i, dims));
+                                }
+                            },
+                            VectorStruct::Named(vectors) => {
+                                for (name, vector) in vectors {
+                                    match vector {
+                                        Vector::Dense(vector) => {
+                                            let dims = if vector.len() > 5 {
+                                                format!("[{}...]", vector[..5].iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                            } else {
+                                                format!("[{}]", vector.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                            };
+                                            result.push_str(&format!("Update point {} vector '{}': {}\n", point.id, name, dims));
+                                        },
+                                        Vector::Sparse(vector) => {
+                                            let dims = if vector.values.len() > 5 {
+                                                format!("[{}...]", vector.values[..5].iter().zip(vector.indices[..5].iter()).map(|(v, i)| format!("{}:{}", i, v)).collect::<Vec<_>>().join(", "))
+                                            } else {
+                                                format!("[{}]", vector.values.iter().zip(vector.indices.iter()).map(|(v, i)| format!("{}:{}", i, v)).collect::<Vec<_>>().join(", "))
+                                            };
+                                            result.push_str(&format!("Update point {} vector '{}': {}\n", point.id, name, dims));
+                                        },
+                                        Vector::MultiDense(vectors) => {
+                                            for (i, vector) in vectors.iter().enumerate() {
+                                                let dims = if vector.len() > 5 {
+                                                    format!("[{}...]", vector[..5].iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                                } else {
+                                                    format!("[{}]", vector.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(", "))
+                                                };
+                                                result.push_str(&format!("Update point {} vector '{}' {}: {}\n", point.id, name, i, dims));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    result
+                },
+                VectorOperations::DeleteVectors(ids, vector_names) => {
+                    format!("Delete vectors {:?} for points: {:?}", vector_names, ids)
+                },
+                VectorOperations::DeleteVectorsByFilter(filter, vector_names) => {
+                    format!("Delete vectors {:?} by filter: {:?}", vector_names, filter)
+                },
+            }
+        },
     }
 }
