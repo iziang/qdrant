@@ -154,8 +154,11 @@ impl Collection {
     ) -> CollectionResult<UpdateResult> {
         operation.validate()?;
 
+        // Format operation vectors once for the initial log and error handling
+        let operation_vectors = format_operation_vectors(&operation);
+        
         // Log operation details including vector dimensions
-        info!("Processing update operation with vectors:{}", format_operation_vectors(&operation));
+        info!("Processing update operation with vectors:{}", operation_vectors);
 
         let update_lock = self.updates_lock.clone().read_owned().await;
         let shard_holder = self.shards_holder.clone().read_owned().await;
@@ -188,6 +191,9 @@ impl Collection {
                                 (peer_id, peer_uri)
                             }
                         };
+                        // Log the operation for this specific shard
+                        info!("Shard {} (peer {} at {}) processing vectors: {}", 
+                            shard_id, peer_id, peer_uri, format_operation_vectors(&operation));
                         let result = shard.update_with_consistency(operation, wait, ordering).await;
                         match &result {
                             Ok(_) => info!("Shard {} (peer {} at {}) update successful", shard_id, peer_id, peer_uri),
@@ -219,7 +225,8 @@ impl Collection {
             let first_err = results.into_iter().find(|result| result.is_err()).unwrap();
             // inconsistent if only a subset of the requests fail - one request per shard.
             if with_error < result_len {
-                warn!("Partial failure: {} out of {} shards failed across different peers", with_error, result_len);
+                warn!("Partial failure: {} out of {} shards failed across different peers, operation vectors: {}", 
+                    with_error, result_len, operation_vectors);
                 first_err.map_err(|err| {
                     // compute final status code based on the first error
                     // e.g. a partially successful batch update failing because of bad input is a client error
@@ -230,7 +237,8 @@ impl Collection {
                     }
                 })
             } else {
-                warn!("All shards failed: {} shards total across different peers", result_len);
+                warn!("All shards failed: {} shards total across different peers, operation vectors: {}", 
+                    result_len, operation_vectors);
                 // all requests per shard failed - propagate first error (assume there are all the same)
                 first_err
             }
